@@ -1865,24 +1865,33 @@ impl Agent {
         }
 
         let agent = Arc::clone(self);
+        let session_id = session_config.id.clone();
         Ok(Some(Box::pin(async_stream::try_stream! {
-            let initial_stream = if resume_from_persisted_response {
-                Some(
-                    agent
-                        .stream_state_machine_session(
-                            session_config.clone(),
-                            cancel.clone(),
-                        )
-                        .await?,
-                )
-            } else {
-                None
-            };
-            let mut stream = agent.stream_state_machine_turn(
-                session_config,
-                cancel,
-                turn_guard,
-                initial_stream,
+            let initial_stream = crate::session_context::with_session_id(
+                Some(session_id.clone()),
+                async {
+                    if resume_from_persisted_response {
+                        agent
+                            .stream_state_machine_session(
+                                session_config.clone(),
+                                cancel.clone(),
+                            )
+                            .await
+                            .map(Some)
+                    } else {
+                        Ok(None)
+                    }
+                },
+            )
+            .await?;
+            let mut stream = crate::session_context::scoped_session_id_stream(
+                session_id.clone(),
+                agent.stream_state_machine_turn(
+                    session_config,
+                    cancel,
+                    turn_guard,
+                    initial_stream,
+                ),
             );
             while let Some(event) = stream.next().await {
                 yield event?;
@@ -2048,15 +2057,22 @@ impl Agent {
         use_state_machine: bool,
         cancel_token: Option<CancellationToken>,
     ) -> Result<BoxStream<'_, Result<AgentEvent>>> {
+        let session_id = session_config.id.clone();
         let reply_span = tracing::Span::current();
-        let events = self
-            .reply_impl(
+        let events = crate::session_context::with_session_id(
+            Some(session_id.clone()),
+            self.reply_impl(
                 user_message,
                 session_config,
                 use_state_machine,
                 cancel_token,
-            )
-            .await?;
+            ),
+        )
+        .await?;
+
+        // Keep the session id scoped for the lifetime of the stream so every
+        // provider request made while polling carries the session header
+        let events = crate::session_context::scoped_session_id_stream(session_id, events);
 
         // This is the single live-event identity boundary. Callers that intentionally stream
         // multiple events for one logical message must assign their shared ID before this point.
@@ -5080,6 +5096,102 @@ echo start >> "$PLUGIN_ROOT/hook.log"
             )
             .await?;
         Ok((agent, session.id))
+    }
+
+    struct SessionScopedProvider {
+        observed: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::providers::base::Provider for SessionScopedProvider {
+        async fn stream(
+            &self,
+            _model_config: &goose_providers::model::ModelConfig,
+            _system_prompt: &str,
+            _messages: &[Message],
+            _tools: &[Tool],
+        ) -> Result<MessageStream, ProviderError> {
+            self.observed
+                .lock()
+                .unwrap()
+                .push(crate::session_context::current_session_id());
+            let usage = ProviderUsage::new("mock-model".to_string(), Usage::default());
+            Ok(stream_from_single_message(
+                Message::assistant().with_text("hello"),
+                usage,
+            ))
+        }
+
+        fn get_name(&self) -> &str {
+            "session-scoped-test"
+        }
+
+        async fn fetch_model_info(
+            &self,
+            model_name: &str,
+        ) -> Result<goose_providers::base::ModelInfo, ProviderError> {
+            self.observed
+                .lock()
+                .unwrap()
+                .push(crate::session_context::current_session_id());
+            Ok(goose_providers::base::model_info_for_provider_model(
+                self.get_name(),
+                model_name,
+            ))
+        }
+
+        async fn resume(&self, _session_id: &str) -> Result<(), ProviderError> {
+            self.observed
+                .lock()
+                .unwrap()
+                .push(crate::session_context::current_session_id());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn session_id_is_scoped_for_provider_setup_and_stream() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let hook_manager = crate::hooks::HookManager::from_plugins_for_test(vec![]);
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (agent, session_id) = create_test_agent(
+            temp_dir.path().join("data"),
+            hook_manager,
+            Arc::new(SessionScopedProvider {
+                observed: observed.clone(),
+            }),
+        )
+        .await?;
+        let session_config = SessionConfig {
+            id: session_id.clone(),
+            schedule_id: None,
+            max_turns: Some(1),
+            retry_config: None,
+        };
+        let reply_stream = agent
+            .reply(
+                Message::user().with_text("hi"),
+                session_config,
+                crate::agents::state_machine::enabled(),
+                None,
+            )
+            .await?;
+        tokio::pin!(reply_stream);
+        while let Some(event) = reply_stream.next().await {
+            event?;
+        }
+        let observed = observed.lock().unwrap();
+        let expected = Some(session_id);
+        assert!(
+            !observed.is_empty(),
+            "provider setup and stream requests should be observed"
+        );
+        assert!(
+            observed.iter().all(|id| id == &expected),
+            "every provider request should observe the session id, got {:?}",
+            *observed
+        );
+        Ok(())
     }
 
     struct TraceContentProvider;

@@ -203,17 +203,22 @@ fn thinking_effort_error(error: anyhow::Error) -> agent_client_protocol::Error {
 async fn resume_saved_provider_session(
     provider: &Arc<dyn Provider>,
     conversation: Option<&Conversation>,
+    session_id: &str,
 ) {
     let Some(conversation) = conversation else {
         return;
     };
     let provider_name = provider.get_name();
-    let Some(session_id) =
+    let Some(provider_session_id) =
         crate::agents::latest_provider_session_id(conversation.messages(), provider_name)
     else {
         return;
     };
-    if let Err(error) = provider.resume(session_id).await {
+    let resume = crate::session_context::with_session_id(
+        Some(session_id.to_string()),
+        provider.resume(provider_session_id),
+    );
+    if let Err(error) = resume.await {
         warn!(
             provider = provider_name,
             %error,

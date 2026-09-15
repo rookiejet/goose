@@ -419,7 +419,8 @@ impl GooseAcpAgent {
             .provider()
             .await
             .internal_err_ctx("Failed to get provider while loading ACP session")?;
-        resume_saved_provider_session(&provider, session.conversation.as_ref()).await;
+        resume_saved_provider_session(&provider, session.conversation.as_ref(), &session_id_str)
+            .await;
         session = self
             .session_manager
             .get_session(&session_id_str, false)
@@ -499,6 +500,7 @@ mod tests {
     #[derive(Debug)]
     struct ResumeEffortProvider {
         resumed: AtomicBool,
+        observed_session_id: std::sync::Mutex<Option<String>>,
     }
 
     #[async_trait::async_trait]
@@ -509,6 +511,8 @@ mod tests {
 
         async fn resume(&self, session_id: &str) -> std::result::Result<(), ProviderError> {
             assert_eq!(session_id, "saved-inner-session");
+            *self.observed_session_id.lock().unwrap() =
+                crate::session_context::current_session_id();
             self.resumed.store(true, Ordering::Release);
             Ok(())
         }
@@ -544,6 +548,7 @@ mod tests {
     async fn saved_provider_session_is_resumed_before_effort_snapshot() {
         let provider = Arc::new(ResumeEffortProvider {
             resumed: AtomicBool::new(false),
+            observed_session_id: std::sync::Mutex::new(None),
         });
         let conversation = Conversation::new_unvalidated([Message::assistant().with_inference(
             InferenceMetadata {
@@ -555,12 +560,36 @@ mod tests {
         )]);
 
         let provider_dyn: Arc<dyn Provider> = provider.clone();
-        resume_saved_provider_session(&provider_dyn, Some(&conversation)).await;
+        resume_saved_provider_session(&provider_dyn, Some(&conversation), "acp-session").await;
 
         let ThinkingEffortSupport::Options(capability) = provider.thinking_effort_support() else {
             panic!("expected resumed effort capability");
         };
         assert_eq!(capability.current.as_deref(), Some("high"));
+    }
+
+    #[tokio::test]
+    async fn saved_provider_session_resume_carries_the_goose_session_id() {
+        let provider = Arc::new(ResumeEffortProvider {
+            resumed: AtomicBool::new(false),
+            observed_session_id: std::sync::Mutex::new(None),
+        });
+        let conversation = Conversation::new_unvalidated([Message::assistant().with_inference(
+            InferenceMetadata {
+                provider: "claude-acp".to_string(),
+                requested_model: "current".to_string(),
+                resolved_model: None,
+                provider_session_id: Some("saved-inner-session".to_string()),
+            },
+        )]);
+
+        let provider_dyn: Arc<dyn Provider> = provider.clone();
+        resume_saved_provider_session(&provider_dyn, Some(&conversation), "goose-session-42").await;
+
+        assert_eq!(
+            provider.observed_session_id.lock().unwrap().as_deref(),
+            Some("goose-session-42"),
+        );
     }
 
     #[test]

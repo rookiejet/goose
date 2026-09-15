@@ -59,7 +59,12 @@ impl GooseAcpAgent {
             .provider()
             .await
             .internal_err_ctx("Failed to get provider while forking ACP session")?;
-        resume_saved_provider_session(&provider, goose_session.conversation.as_ref()).await;
+        resume_saved_provider_session(
+            &provider,
+            goose_session.conversation.as_ref(),
+            &goose_session.id,
+        )
+        .await;
         let effort_support = agent_thinking_effort_support(&agent).await;
 
         let acp_session_id = SessionId::new(new_session_id.clone());

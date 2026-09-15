@@ -1,3 +1,5 @@
+use futures::stream::BoxStream;
+use futures::StreamExt;
 use reqwest::header::{HeaderName, HeaderValue};
 
 pub const SESSION_ID_HEADER: &str = "agent-session-id";
@@ -18,6 +20,21 @@ where
 
 pub fn current_session_id() -> Option<String> {
     SESSION_ID.try_with(|id| id.clone()).ok().flatten()
+}
+
+/// Poll a stream with the session id in scope for each poll so any provider
+/// request made while polling carries the session header
+pub fn scoped_session_id_stream<'a, T: 'a, E: 'a>(
+    session_id: String,
+    stream: BoxStream<'a, Result<T, E>>,
+) -> BoxStream<'a, Result<T, E>> {
+    Box::pin(futures::stream::unfold(
+        (stream, session_id),
+        |(mut stream, session_id)| async move {
+            let next = with_session_id(Some(session_id.clone()), stream.next()).await;
+            next.map(|item| (item, (stream, session_id)))
+        },
+    ))
 }
 
 pub fn session_id_request_builder() -> goose_providers::api_client::RequestBuilderDecorator {
@@ -182,5 +199,39 @@ mod tests {
     #[test]
     fn test_session_id_request_builder_rejects_invalid_header_override() {
         assert!(session_id_request_builder_with_header_override(Some("invalid header")).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_scoped_session_id_stream_sets_id_during_polling() {
+        let stream = futures::stream::iter([1, 2, 3])
+            .map(|value| Ok::<_, ()>((current_session_id(), value)));
+        let scoped = scoped_session_id_stream("stream-session".to_string(), Box::pin(stream));
+        futures::pin_mut!(scoped);
+        let mut items = Vec::new();
+        while let Some(item) = scoped.next().await {
+            items.push(item.unwrap());
+        }
+        assert_eq!(
+            items,
+            vec![
+                (Some("stream-session".to_string()), 1),
+                (Some("stream-session".to_string()), 2),
+                (Some("stream-session".to_string()), 3),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scoped_session_id_stream_clears_id_after_drain() {
+        let stream = futures::stream::iter([1]);
+        let scoped = scoped_session_id_stream(
+            "stream-session".to_string(),
+            Box::pin(stream.map(Ok::<_, ()>)),
+        );
+        futures::pin_mut!(scoped);
+        while let Some(item) = scoped.next().await {
+            item.unwrap();
+        }
+        assert_eq!(current_session_id(), None);
     }
 }
